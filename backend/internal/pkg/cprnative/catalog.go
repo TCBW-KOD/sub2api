@@ -2,53 +2,60 @@
 package cprnative
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 )
 
-// FilterCatalog preserves the CPR representation byte-for-byte unless model
-// authorization actually removes an entry. Never add model capabilities or
-// rewrite use_responses_lite, tool metadata or model names.
-func FilterCatalog(body []byte, allow func(string) bool) ([]byte, bool, error) {
+// FilterCatalog applies only the host's model access policy, never model
+// capability defaults or compatibility mappings. If no entry is removed the
+// original bytes (and therefore the upstream ETag) remain usable.
+// When filtering is necessary each retained entry is kept as RawMessage.
+func FilterCatalog(body []byte, allowed func(string) bool) ([]byte, bool, error) {
 	if err := ValidateJSON(body); err != nil {
 		return nil, false, err
 	}
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(body, &envelope); err != nil || envelope == nil {
-		return nil, false, errors.New("CPR model catalog must be a JSON object")
+	root := rawObject(body)
+	if root == nil {
+		return nil, false, errors.New("CPR model catalog must be an object")
 	}
-	field, idKey := "models", "slug"
-	if _, ok := envelope[field]; !ok {
-		field, idKey = "data", "id"
+	key := "models"
+	if _, exists := root[key]; !exists {
+		key = "data"
+	}
+	raw, exists := root[key]
+	if !exists {
+		return nil, false, errors.New("CPR model catalog lacks models/data array")
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, false, errors.New("CPR model catalog array is null")
 	}
 	var entries []json.RawMessage
-	if raw, ok := envelope[field]; !ok || string(raw) == "null" {
-		return nil, false, errors.New("CPR model catalog has no model array")
-	} else if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, false, err
+	if json.Unmarshal(raw, &entries) != nil {
+		return nil, false, errors.New("CPR model catalog array is invalid")
 	}
-	if allow == nil {
+	if allowed == nil {
 		return body, false, nil
 	}
 	kept := make([]json.RawMessage, 0, len(entries))
 	for _, entry := range entries {
-		var model map[string]json.RawMessage
-		var id string
-		if json.Unmarshal(entry, &model) == nil {
-			_ = json.Unmarshal(model[idKey], &id)
+		model := rawObject(entry)
+		id := rawString(model, "slug")
+		if id == "" {
+			id = rawString(model, "id")
 		}
-		if id != "" && allow(id) {
+		if id != "" && allowed(id) {
 			kept = append(kept, entry)
 		}
 	}
 	if len(kept) == len(entries) {
 		return body, false, nil
 	}
-	raw, err := json.Marshal(kept)
+	encoded, err := json.Marshal(kept)
 	if err != nil {
 		return nil, false, err
 	}
-	envelope[field] = raw
-	out, err := json.Marshal(envelope)
+	root[key] = encoded
+	out, err := json.Marshal(root)
 	return out, true, err
 }
